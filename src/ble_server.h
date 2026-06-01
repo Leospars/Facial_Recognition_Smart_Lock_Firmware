@@ -22,6 +22,8 @@ public:
   bool isConnected();
   bool hasReceivedPayload();
   bool hasReceivedIPAck();
+  bool requireWifiScan();
+  void wifiScanCompleted(const String &networks);
   void end();
 
 private:
@@ -31,6 +33,7 @@ private:
   bool deviceConnected;
   bool payloadReceived;
   bool ipReceivedAck;
+  bool wifiScanRequired;
 
   friend class ServerCallbacks;
   friend class RxCharacteristicCallbacks;

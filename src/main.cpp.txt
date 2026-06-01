@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <FastLED.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
@@ -19,23 +18,19 @@
 
 // --- Pins (As specified) ---
 #define LOCK_PIN 7
-#define SBC_PWR_PIN 8
-#define BATTERY_PIN 6
-#define PIR_PIN 4
-#define BUTTON_PIN 5
+#define SBC_PWR_PIN 4
+#define BATTERY_PIN 8
+#define PIR_PIN 5
+#define BUTTON_PIN 6
 #define T_IRQ 21    // Touch Interrupt
-#define TFT_LED 13  // TFT Backlight
-#define RGB_LED_PIN 48  // RGB LED data pin for ESP32-S3 DevKitM
-#define NUM_LEDS 1
-#define BRIGHTNESS 40
-CRGB leds[NUM_LEDS];
+#define TFT_LED 10  // TFT Backlight
 
 // Display PINS initialized in User_Setup.h of TFT_eSPI Library
 
 // --- Configuration & Credentials ---
 #define LOCK_ID "c0ffee01-1234-4abc-9def-9876543210aa"  // Unique Lock Identifier UUIDv7
 #define SIMPLE_ID "coff"                                // Simple ID (first 4 characters of LOCK_ID)
-#define LOCK_MODEL "JUPY Lock Pro"                      // Lock Model
+#define LOCK_MODEL "JUPY Block Pro"                     // Lock Model
 #define FIRMWARE_VERSION "v1.0"                         // Firmware version
 #define PAIRING_CODE "123456"                           // Lock Pairing Code
 #define RESET_PIN "01455489"               // Reset PIN for factory reset/delete lock via REST API/touch pad
@@ -44,36 +39,13 @@ CRGB leds[NUM_LEDS];
 #define BATT_CHECK_TIMEOUT 5 * 60000ULL    // 5 minutes
 #define COMMISSION_TIME 10 * 60000UL       // 10 minutes
 #define MQTT_ACTIVE_TIMEOUT 2 * 60000UL    // 2 minutes
-#define SBC_POWEROFF_DELAY 2000UL          // 2s grace period for Pi cleanup before GPIO LOW
+#define SBC_MAX_UPTIME 3000UL            // 3 seconds
 #define MAX_NOTIF 10                       // Max notifications to store offline
 #define DEF_NOTIF_NAME "Manual Operation"  // Default notification name
 
-// --- Remote MQTT (HiveMQ Cloud) ---
 const char *mqtt_server = "72300a81dfec465f840ffafaa812a8bb.s1.eu.hivemq.cloud";
 const char *mqtt_user = "jupyLock";
 const char *mqtt_pwd = "jupyLock012";
-
-// --- Local MQTT broker (Raspberry Pi 5 / jupy_bridge.local) ---
-// Uses same credentials as HiveMQ for consistency (Mosquitto configured with password auth)
-const char *local_mqtt_host = "jupy-bridge.local";
-const uint16_t local_mqtt_port = 1883;
-const char *local_mqtt_user = "jupyLock";
-const char *local_mqtt_pwd = "jupyLock012";
-
-// --- Local MQTT Topics ---
-// ESP32 → Pi
-#define TOPIC_SBC_CMD                                                                                                  \
-  "jupy/sbc/cmd"  // Commands to SBC: on, capture_face, doorbell_chime, start_call, update_settings, commission,
-                  // power_off
-#define TOPIC_SETTINGS "jupy/settings"  // Full settings JSON push → Pi writes to settings.json
-// Pi → ESP32
-#define TOPIC_SBC_STATUS "jupy/sbc/status"  // Status responses from SBC: match, intruder, no_face, awake, error, etc.
-
-// --- Firebase Cloud Messaging ---
-const char *fcm_server = "fcm.googleapis.com";
-const char *fcm_key = "YOUR_FCM_SERVER_KEY";  // Legacy Key or OAuth2 Relay
-
-// --- Supabase ---
 const char *projectId = "ienqcmbfdobzcggkhajc";
 const String api_base_endpoint = "https://" + String(projectId) + ".supabase.co/functions/v1/make-server-a213de84";
 // ("http://" + String(laptop_ip) + ":3000/api/lock/register").c_str(); //local dev
@@ -90,13 +62,8 @@ String touchpad_keys[4][3] = {
 const byte ROWS = 4;
 const byte COLS = 4;
 char keypad_keys[ROWS][COLS] = {{'1', '2', '3', ' '}, {'4', '5', '6', ' '}, {'7', '8', '9', ' '}, {'x', '0', '#', ' '}};
-byte rowPins[ROWS] = {13, 12, 11, 10};
+byte rowPins[ROWS] = {13, 12, 11, 9};
 byte colPins[COLS] = {18, 17, 16, 15};
-// Remapped pinout for telephone style-membrane switch 3x4 Keypad {C1, C2, C3, C4, R1, R2, R3, R4}=>{C2, R1, C1, R4, C3,
-// R3, R2}
-// byte rowPins[ROWS] = {16, 12, 11, 18};
-// byte colPins[COLS] = {17, 15, 10};
-
 Keypad keypad = Keypad(makeKeymap(keypad_keys), rowPins, colPins, ROWS, COLS);
 
 /****** root certificate (for HiveMQ TLS) *********/
@@ -134,17 +101,10 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
 )EOF";
 
-// --- Client Instances ---
+// --- Instances ---
 TFT_eSPI tft = TFT_eSPI();
-
-// Remote MQTT (HiveMQ Cloud) — TLS, for app commands and online presence
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
-
-// Local MQTT (Mosquitto on Pi) — plaintext, for SBC command/response
-WiFiClient localEspClient;
-PubSubClient localMqttClient(localEspClient);
-
 WebServer localServer(80);
 Preferences prefs;
 BLECommissioningServer bleServer;
@@ -166,7 +126,6 @@ unsigned long lastActivity = 0;
 unsigned long sbcStartTime = 0;
 unsigned long sbcUpTime = 0;
 unsigned long lastBatCheck = 0;
-unsigned long sbcPowerOffAt = 0;  // Non-zero = GPIO power-off pending after grace delay
 std::vector<unsigned long> touchFadeTime(12, 0);
 
 std::vector<int> lastTouchX(12, -1);
@@ -175,9 +134,6 @@ std::vector<int> lastTouchColor(12, TFT_BLACK);
 uint8_t unlockAttempts = 0;
 
 bool mqttActive = false;
-bool localMqttConnected = false;
-unsigned long lastLocalMqttRetry = 0;
-unsigned long lastMqttRetry = 0;
 bool sbcIsRunning = false;
 bool longSBCActivity = false;
 bool pinManuallyEntered = false;
@@ -195,6 +151,7 @@ std::array<String[3], 10> pendingNotifications;
 
 // Function Prototypes
 void handlePIR();
+void handleUART();
 void handleTouch();
 void handleKeypad();
 void processKeyPress(int row, int col, int x, int y);
@@ -202,11 +159,7 @@ void handleTimeouts();
 void monitorBattery(const bool startupCheck = false);
 void initialCommisioning();
 void connectToWifi(const String &ssid, const String &password);
-void sendToSBC(String command);
-void SBCPowerOff();
-void reconnectLocalMQTT();
-void localMqttCallback(char *topic, byte *payload, unsigned int length);
-void handleLocalMqttMsg(const String &status, JsonDocument &doc);
+void wakeSBC(String command = "{\"cmd\":\"on\"}");
 
 bool checkPin(const char *);
 void touch_calibrate();
@@ -222,7 +175,6 @@ void reconnectMQTT();
 void startMQTTSession();
 void endMQTTSession();
 String getCurrentTimestamp();
-void startDeepSleep(unsigned long milli_sec = 0);
 
 struct HTTPResponse {
   int code;
@@ -245,27 +197,6 @@ void wakeUpReason() {
   }
 }
 
-CRGB DEF_LED_COLOR = CRGB::Red;
-CRGB CURRENT_LED_COLOR = DEF_LED_COLOR;
-CRGB KEY_PRESSED_COLOR = CRGB::Green;
-
-void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
-  leds[0] = CRGB(r, g, b);
-  FastLED.show();
-  CURRENT_LED_COLOR = CRGB(r, g, b);
-}
-
-void setLEDColor(CRGB color) {
-  leds[0] = color;
-  FastLED.show();
-  CURRENT_LED_COLOR = color;
-}
-
-void resetLEDColor() {
-  CURRENT_LED_COLOR = DEF_LED_COLOR;
-  setLEDColor(CURRENT_LED_COLOR);
-}
-
 void setup() {
   Serial.begin(115200);
   wakeUpReason();
@@ -282,46 +213,44 @@ void setup() {
 
   tft.init();
   tft.setRotation(0);
+  // Replace with your actual calibration numbers from touch_calibrate()
   uint16_t calData[5] = {309, 3472, 357, 3449, 4};
   tft.setTouch(calData);
 
+  // touch_calibrate();
   pinMode(PIR_PIN, INPUT_PULLDOWN);
   pinMode(LOCK_PIN, OUTPUT);
   pinMode(SBC_PWR_PIN, OUTPUT);
   pinMode(BATTERY_PIN, INPUT_PULLDOWN);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  FastLED.addLeds<NEOPIXEL, RGB_LED_PIN>(leds, NUM_LEDS);
-  FastLED.setBrightness(BRIGHTNESS);
 
   digitalWrite(LOCK_PIN, LOW);  // Fail-secure: LOW keeps locked
-  digitalWrite(SBC_PWR_PIN, LOW);
-
-  setLEDColor(CRGB::Lavender);
 
   Serial.println("Booting up... Turning on SBC & Unlock for 2 seconds");
-  digitalWrite(SBC_PWR_PIN, HIGH);
-  delay(2000);
-  digitalWrite(SBC_PWR_PIN, LOW);
-  digitalWrite(LOCK_PIN, HIGH);
-  delay(2000);
-  digitalWrite(LOCK_PIN, LOW);
+  digitalWrite(SBC_PWR_PIN, HIGH);  // SBC show lock working
+  delay(2000);                        // Simulate SBC boot time
+  digitalWrite(SBC_PWR_PIN, LOW);   // SBC off by default
+  digitalWrite(LOCK_PIN, HIGH);       // SBC show lock working
+  delay(2000);                        // Simulate SBC boot time
+  digitalWrite(LOCK_PIN, LOW);        // SBC off by default
 
+  // Print SPI pins that arew being used by display
   Serial.print("Touch CS pin: " + String(TOUCH_CS));
   Serial.printf("TFT SPI Frequency: %d Hz\n", SPI_FREQUENCY);
-  Serial.printf("TFT SPI PINS: MISO: %d, MOSI: %d, SCLK: %d, CS: %d, DC: %d, RST: %d, T_CS: %d, T_IRQ: %d\n", TFT_MISO,
-                TFT_MOSI, TFT_SCLK, TFT_CS, TFT_DC, TFT_RST, TOUCH_CS, T_IRQ);
-
-  resetLEDColor();
+  Serial.printf("TFT SPI PINS: MISO: %d, MOSI: %d, SCLK: %d, CS: %d, DC: %d, RST: %d, "
+                "T_CS: %d, T_IRQ: %d\n",
+                TFT_MISO, TFT_MOSI, TFT_SCLK, TFT_CS, TFT_DC, TFT_RST, TOUCH_CS, T_IRQ);
 
   // 0. Initialize Storage
   prefs.begin("my_storage", false);
   prefs.putString("pairing_code", PAIRING_CODE);
+  // TODO: Remove this line after implementing refresh token flow properly later
   prefs.putString("refresh_token", "refresh_token");
   Serial.println("Stored pin: " + prefs.getString("pin"));
   notify_all_motion = prefs.getBool("notify_all_motion", notify_all_motion);
   share_analytics = prefs.getBool("share_analytics", share_analytics);
 
-  if (prefs.getString("settings").isEmpty()) {
+  if (prefs.getString("settings").isEmpty()) {  // If no settings stored, initialize default settings in prefs
     JsonDocument defaultSettings;
     defaultSettings["cam_resolution"] = 1024;
     defaultSettings["call_timeout"] = 40;
@@ -335,15 +264,15 @@ void setup() {
     prefs.putString("settings", defaultSettingsStr);
   }
 
-  // 1. BLE Provisioning & Transition
-  Serial.println("Check for commissioning");
-  initialCommisioning();
+  // 1. Matter/BLE Provisioning & Transition
+  Serial.println("Check for commsioning");
+  initialCommisioning();  // Retrieves wifi and user credentials
 
   // 2. Local REST API
   Serial.println("Setup Rest Server");
   setupREST();
 
-  // 3. SNTP, Battery, RESET mode
+  // 3. Initialize SNTP, Check battery and RESET mode
   monitorBattery();
   configTime(0, 0, "pool.ntp.org");
 
@@ -353,20 +282,13 @@ void setup() {
     return;
   }
 
-  // 4. Remote MQTT (HiveMQ)
+  // 4. Initialize MQTT CLient
   espClient.setCACert(root_ca);
   mqttClient.setServer(mqtt_server, 8883);
   mqttClient.setCallback(mqttCallback);
   if (WiFi.status() == WL_CONNECTED) {
     mqttActive = true;
     reconnectMQTT();
-  }
-
-  // 5. Local MQTT (Mosquitto on SBC)
-  localMqttClient.setServer(local_mqtt_host, local_mqtt_port);
-  localMqttClient.setCallback(localMqttCallback);
-  if (WiFi.status() == WL_CONNECTED) {
-    reconnectLocalMQTT();
   }
 
   Serial.print("Device Setup Complete. ");
@@ -377,12 +299,12 @@ void setup() {
 
 void loop() {
   handleTimeouts();
-
   if (digitalRead(BUTTON_PIN) == LOW) {
     unlockDoor("Manual Operation", "Button");
   }
 
   handlePIR();
+  handleUART();
   handleKeypad();
   handleTouch();
 
@@ -402,228 +324,78 @@ void loop() {
   monitorBattery();
   localServer.handleClient();
 
-  // Remote MQTT loop
   if (mqttActive) {
     if (!mqttClient.connected()) {
       reconnectMQTT();
     }
     mqttClient.loop();
   }
-
-  // Local MQTT loop — always attempt to stay connected when WiFi is up
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!localMqttClient.connected()) {
-      reconnectLocalMQTT();
-    }
-    localMqttClient.loop();
-  }
-
-  // Deferred GPIO power-off: fire after grace delay so Pi can finish cleanup
-  if (sbcPowerOffAt > 0 && millis() >= sbcPowerOffAt) {
-    sbcPowerOffAt = 0;
-    digitalWrite(SBC_PWR_PIN, LOW);
-    Serial.println("[SBC] GPIO power rail LOW (deferred).");
-  }
 }
 
 // --- CORE LOGIC FUNCTIONS ---
 
 void handlePIR() {
+  // Serial.printf("[PIR] PIR: %d, State: %d, SBC: %d\n", PIR_PIN, digitalRead(PIR_PIN), sbcIsRunning);
   if (digitalRead(PIR_PIN) == HIGH && !sbcIsRunning) {
     delay(50);  // Debounce
     Serial.println("[PIR] Motion Detected! Waking up Vision System...");
     startMQTTSession();
-    sendToSBC("{\"cmd\":\"on\"}");
+    wakeSBC();
   }
 }
 
-void sendToSBC(String command) {
-  // Power on the Pi GPIO rail (still used for hardware power control)
+void wakeSBC(String command) {
   digitalWrite(SBC_PWR_PIN, HIGH);
-
-  // Augment command with face_timeout if relevant
   if (faceUnlockTimeout) {
     command.replace("}", ", \"face_timeout\":true }");
+    // Disable camera on start up and skip face recog code,
+    // but if doorbell request then enable camera on SBC side
   }
-
+  command.replace("{\"cmd\"", "[UART] {\"cmd\"");
+  Serial.println(command);
   sbcStartTime = millis();
   sbcIsRunning = true;
-
-  if (localMqttClient.connected()) {
-    bool ok = localMqttClient.publish(TOPIC_SBC_CMD, command.c_str());
-    Serial.printf("[LOCAL MQTT] → %s : %s [%s]\n", TOPIC_SBC_CMD, command.c_str(), ok ? "ok" : "FAIL");
-  } else {
-    // Broker not reachable — log and attempt reconnect next loop tick
-    Serial.printf("[LOCAL MQTT] Not connected. Dropping SBC command: %s\n", command.c_str());
-    serverLog("{\"event\":\"sbc_cmd_dropped\", \"cmd\":" + command + "}");
-  }
 }
 
-// SBCPowerOff: sends power_off command to Pi for cleanup, then schedules
-// GPIO LOW after SBC_POWEROFF_DELAY ms to give the Pi time to respond.
 void SBCPowerOff() {
-  if (localMqttClient.connected()) {
-    String offCmd = "{\"cmd\":\"power_off\", \"uptime\":" + String(sbcUpTime / 1000) + "}";
-    localMqttClient.publish(TOPIC_SBC_CMD, offCmd.c_str());
-    Serial.println("[LOCAL MQTT] → power_off command sent to SBC.");
-  }
-
-  // Schedule GPIO LOW after grace period
-  sbcPowerOffAt = millis() + SBC_POWEROFF_DELAY;
-
+  digitalWrite(SBC_PWR_PIN, LOW);
   sbcIsRunning = false;
   longSBCActivity = false;
   serverLog("{\"event\":\"sbc_power_off\", \"uptime\":\"" + String(sbcUpTime / 1000) + "\"}");
   sbcUpTime = 0;
-  Serial.println("[SBC] Power-off scheduled (GPIO LOW in " + String(SBC_POWEROFF_DELAY) + "ms).");
+  Serial.println("SBC Powered Off.");
 }
 
-// localMqttCallback: called by PubSubClient when a message arrives on a subscribed local topic.
-// This is the direct replacement for handleUART() — same status branch logic, no behavioral changes.
-void localMqttCallback(char *topic, byte *payload, unsigned int length) {
-  byte buffer[length + 1];
-  memcpy(buffer, payload, length);
-  buffer[length] = '\0';
-
-  String topicStr = String(topic);
-  Serial.printf("[LOCAL MQTT] ← %s : %s\n", topic, (char *)buffer);
-
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, buffer);
-  if (error) {
-    Serial.printf("[LOCAL MQTT] JSON parse error on topic %s: %s\n", topic, error.c_str());
-    return;
-  }
-
-  if (topicStr == TOPIC_SBC_STATUS) {
-    handleLocalMqttMsg(doc["status"].as<String>(), doc);
-  }
-}
-
-String cleanMqttMessage(const String &msg) {
-  String cleaned = msg;
-  cleaned.replace("\n", "\\n");
-  cleaned.replace("\r", "\\r");
-  cleaned.replace("\"", "\\\"");
-  return cleaned;
-}
-// handleLocalMqttMsg: extracted from the old handleUART() body — unchanged logic.
-void handleLocalMqttMsg(const String &status, JsonDocument &doc) {
-  lastActivity = millis();
-
-  if (status == "match") {
-    unlockDoor(doc["name"], "Face");
-    notify("Lock Status", "Unlocked by " + doc["name"].as<String>() + " (Face)", doc["name"].as<String>());
-    serverLog("{\"event\":\"unlock\", \"method\":\"face\", \"success\":\"true\", \"name\":\"" +
-              doc["name"].as<String>() + "\"}");
-    SBCPowerOff();
-
-  } else if (status == "intruder") {
-    notify("Intruder Alert!", "Unknown face detected at door.");
-    serverLog("{\"event\":\"unlock\", \"method\":\"face\", \"success\":\"false\"}");
-    intruder += 1;
-    if (intruder <= 3) {
-      sbcUpTime += millis() - sbcStartTime;
-      sbcStartTime = millis();
-    } else {
-      faceUnlockTimeout = millis();
-      SBCPowerOff();
-    }
-
-  } else if (status == "no_face") {
-    Serial.println("[SBC] No face detected.");
-    if (notify_all_motion) notify("Motion Detected", "Motion detected but no face found.");
-
-  } else if (status == "awake") {
-    bootTime = (millis() - sbcStartTime);
-    serverLog("{\"event\":\"boot\", \"bootTime\":\"" + String(float(bootTime) / 1000.0, 4) + "\"}");
-
-  } else if (status == "call_active" || status == "long_task_active") {
-    longSBCActivity = true;
-    sbcIsRunning = true;
-    if (share_analytics) serverLog("{\"event\":\"" + status + "\"}");
-
-  } else if (status == "call_ended" || status == "long_task_ended") {
-    longSBCActivity = false;
-    SBCPowerOff();
-
-  } else if (status == "call_log") {
-    String log;
-    serializeJson(doc["log"].as<JsonArray>(), log);
-    serverLog("{\"event\":\"call\", \"call_duration\":" + String(doc["call_duration"].as<int>()) + ",\"call_log\":\"" +
-              log + "\"}");
-
-  } else if (status == "error") {
-    String error = cleanMqttMessage(doc["error"].as<String>());
-    notify("SBC Error", error, "SBC");
-    serverLog("{\"event\":\"sbc_error\", \"error\":\"" + error + "\"}");
-    longSBCActivity = false;
-  } else if (status == "commission_success") {
-    Serial.println("[SBC] Commissioning SBC successful!");
-    String payload = "{\"sbc_ip_address\":\"" + doc["sbc_ip_address"].as<String>() + "\",\"sbc_hostname\":\"" +
-                     doc["sbc_hostname"].as<String>() + "\"}";
-    handleApiRequest(lock_endpoint, payload.c_str(), "", HTTP_PATCH);
-  } else {
-    Serial.println("[SBC] Unknown status: " + status);
-  }
-}
-
-// reconnectLocalMQTT: mirrors the reconnectMQTT() pattern with non-blocking 5s retry.
-void reconnectLocalMQTT() {
-  if (localMqttClient.connected()) return;
-
-  unsigned long now = millis();
-  if (lastLocalMqttRetry != 0 && now - lastLocalMqttRetry < 5000) return;
-  lastLocalMqttRetry = now;
-
-  String clientId = String(LOCK_MODEL) + " (local) " + String(SIMPLE_ID);
-  Serial.printf("[LOCAL MQTT] Connecting to %s:%d as %s ...\n", local_mqtt_host, local_mqtt_port, clientId.c_str());
-
-  if (localMqttClient.connect(clientId.c_str(), local_mqtt_user, local_mqtt_pwd)) {
-    Serial.println("[LOCAL MQTT] Connected.");
-    localMqttClient.subscribe(TOPIC_SBC_STATUS, 1);
-    localMqttConnected = true;
-    Serial.printf("[LOCAL MQTT] Subscribed to %s\n", TOPIC_SBC_STATUS);
-  } else {
-    localMqttConnected = false;
-    Serial.printf("[LOCAL MQTT] Connection failed, rc=%d — will retry in 5s\n", localMqttClient.state());
-  }
-}
-
-void startDeepSleep(unsigned long milli_sec) {
+void startDeepSleep(unsigned long milli_sec = 0) {
+  // Disable MQTT and set offline
   if (mqttActive) {
     endMQTTSession();
   }
 
-  // Inform Pi before going to sleep
-  if (localMqttClient.connected()) {
-    localMqttClient.publish(TOPIC_SBC_CMD, "{\"cmd\":\"power_off\", \"reason\":\"sleep\"}");
-    delay(200);  // Brief flush
-    localMqttClient.disconnect();
-  }
-
+  // Shutdown WiFi
   esp_wifi_stop();
   esp_wifi_deinit();
+
+  // Shutdown Bluetooth
   btStop();
   esp_bt_controller_disable();
   esp_bt_controller_deinit();
 
   Serial.println("Radios gracefully shut down.");
-  leds[0] = CRGB::Blue;
-  FastLED.show();
-  digitalWrite(TFT_LED, LOW);
-  digitalWrite(SBC_PWR_PIN, LOW);  // Hard off on sleep, Pi already notified
+  digitalWrite(TFT_LED, LOW);  // Turn off TFT backlight
 
-  uint64_t high_pin_mask = (1ULL << BUTTON_PIN);
-  esp_sleep_enable_ext1_wakeup(high_pin_mask, ESP_EXT1_WAKEUP_ANY_LOW);
-  // esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);  // Wake on LOW (button press)
+  // 1. Enable EXT1 Wakeup (PIR, Button, and Boot Button)
+  // Note: All pins in this call must share the same level (e.g., HIGH)
+  uint64_t pin_mask = (1ULL << BUTTON_PIN) | (1ULL << 0);  // GPIO0 = Boot Button
+  esp_sleep_enable_ext1_wakeup(pin_mask, ESP_EXT1_WAKEUP_ANY_HIGH);
+
+  // 2. Enable Touch Wakeup using touch interrupt pin
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)T_IRQ, 0);  // 0 = Wake on LOW level
+
+  // 3. Timer wakeup if time given else pin interrupt wakeup
   if (milli_sec > 0) esp_sleep_enable_timer_wakeup(milli_sec * 1000ULL);
-  else if (milli_sec == 0)
-    esp_sleep_enable_timer_wakeup(1 * 24 * 60 * 60 * 1000ULL);  // Sleep for a day if no timer specified
 
   Serial.println("Entering Deep Sleep now...");
-
-  Serial.flush();  // Ensure flush completes
   esp_deep_sleep_start();
 }
 
@@ -639,16 +411,10 @@ void display_reset_message(uint8_t presses) {
 }
 
 void display_good_bye_wave() {
+  // TODO: Add waving gif
   tft.fillScreen(TFT_BLACK);
   tft.setTextSize(1);
   tft.println("'Waving' Goodbye!");
-  for (int i = 0; i < 4; i++) {
-    leds[0] = CRGB::Blue;
-    FastLED.show();
-    delay(500);
-    leds[0] = CRGB::DarkMagenta;
-    FastLED.show();
-  }
   tft.println("Thanks for using JUPY Locks!");
   delay(2000);
 }
@@ -659,17 +425,18 @@ void handleTimeouts() {
     Serial.println("[FORCED RESET]: Resetting lock...");
     uint8_t button_presses = 0;
     display_reset_message(button_presses);
+    // Wait for button press to confirm reset
     while (digitalRead(BUTTON_PIN) == LOW) {
       delay(100);
     }
     button_presses = 1;
-    delay(500);
+    delay(500);  // Debounce
     display_reset_message(button_presses);
     while (digitalRead(BUTTON_PIN) == LOW) {
       delay(100);
     }
     button_presses = 2;
-    delay(500);
+    delay(500);  // Debounce
     display_reset_message(button_presses);
 
     HTTPResponse response = handleApiRequest(lock_endpoint, "", "", HTTP_DELETE);
@@ -679,11 +446,12 @@ void handleTimeouts() {
       prefs.clear();
       FORCED_RESET_LOCK = false;
       Serial.println("FORCED RESET: User data cleared.");
-      startDeepSleep(2000);
+      startDeepSleep(2000);  // Sleep for 5 seconds
     } else {
       notify("Reset Failed",
              "Unable to reset lock. Please try again.\nConnection Failed. Error: " + String(response.body), "System");
-      Serial.println("FORCED RESET: Failed. Code: " + String(response.code) + ", body: " + response.body);
+      Serial.println("FORCED RESET: Failed to reset lock.\nResponse code: " + String(response.code) +
+                     ", body: " + response.body);
       tft.fillScreen(TFT_BLACK);
       tft.setTextColor(TFT_RED);
       tft.setTextSize(1);
@@ -696,7 +464,7 @@ void handleTimeouts() {
     }
   }
 
-  // Auth timeout
+  // Auth timeout for API services
   if (authTimeout) {
     if (millis() >= authTimeout + AUTH_DISABLE_TIME) {
       authTimeout = 0;
@@ -705,39 +473,41 @@ void handleTimeouts() {
   }
 
   if (mqttActive) {
+    // Auto-disable MQTT after 2 minutes of no remote commands to save battery
     if (millis() - lastActivity > MQTT_ACTIVE_TIMEOUT) {
       endMQTTSession();
     }
   }
 
-  // SBC timeout (unchanged logic)
-  if (sbcIsRunning && !longSBCActivity && (millis() - sbcStartTime > 3000UL)) {
+  // SBC Power Management (3s x 3 = 9s timeout logic)
+  if (sbcIsRunning && !longSBCActivity && (millis() - sbcStartTime > SBC_MAX_UPTIME)) {
     Serial.println("SBC Timeout: No face detected. Powering down.");
     SBCPowerOff();
   }
 
+  // Timeout after failure extension until pin is manually entered
   if (faceUnlockTimeout && pinManuallyEntered) {
     faceUnlockTimeout = 0;
     intruder = 0;
     pinManuallyEntered = false;
   }
 
-  if (!sbcIsRunning && (millis() - lastActivity > 0.75 * 60 * 1000)) {
+  // Go to sleep if inactive for 3 minutes to save battery
+  if (!sbcIsRunning && (millis() - lastActivity > 3 * 60 * 1000)) {
     Serial.println("Inactivity Timeout (3mins): Entering deep sleep.");
     startDeepSleep();
   }
 }
 
 void unlockDoor(String name, String method) {
+  // Fail-secure lock logic, Adjust logic for your lock type
   if (mqttActive)
     mqttClient.publish(
         (String(LOCK_ID) + "/lock/status").c_str(),
         ("{\"event\":\"unlock\", \"open\":\"true\", \"timestamp\":\"" + getCurrentTimestamp() + "\"}").c_str());
-  setLEDColor(CRGB::Green);
-  digitalWrite(LOCK_PIN, HIGH);
-  delay(3000);
-  digitalWrite(LOCK_PIN, LOW);
-  resetLEDColor();
+  digitalWrite(LOCK_PIN, HIGH);  // Activate Solenoid (Open Lock)
+  delay(3000);                   // Pulse duration
+  digitalWrite(LOCK_PIN, LOW);   // Deactivate
   Serial.println("Door Unlocked by " + name + " using " + method);
   if (mqttActive)
     mqttClient.publish(
@@ -748,6 +518,7 @@ void unlockDoor(String name, String method) {
 }
 
 bool checkPin(const char *passCode) {
+  // Compare pass code from eeprom non volatile memory
   String pin = prefs.getString("pin");
   if (pin.equals("")) {
     Serial.println("No pin code is set");
@@ -756,10 +527,73 @@ bool checkPin(const char *passCode) {
   return pin.equals(passCode);
 }
 
+void handleUART() {
+  if (Serial.available()) {
+    String response = Serial.readStringUntil('\n');
+    if (response.isEmpty()) return;
+
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, response);
+
+    if (!error) {
+      lastActivity = millis();
+      String status = doc["status"];
+      if (status == "match") {
+        unlockDoor(doc["name"], "Face");
+        notify("Lock Status", "Unlocked by " + doc["name"].as<String>() + " (Face)", doc["name"].as<String>());
+        serverLog("{\"event\":\"unlock\", \"method\":\"face\", \"success\":"
+                  "\"true\", \"name\":\"" +
+                  doc["name"].as<String>() + "\"}");
+        SBCPowerOff();
+      } else if (status == "intruder") {
+        notify("Intruder Alert!", "Unknown face detected at door.");
+        serverLog("{\"event\":\"unlock\", \"method\":\"face\", \"success\":\"false\"}");
+        intruder += 1;
+        if (intruder <= 3) {
+          // Stay on for another 3s (reset timer) to capture more frames/upload
+          sbcUpTime += millis() - sbcStartTime;
+          sbcStartTime = millis();
+        } else {
+          faceUnlockTimeout = millis();
+          SBCPowerOff();
+        }
+        serverLog("{\"event\":\"unlock\", \"method\":\"face\", \"success\":\"false\"}");
+      } else if (status == "no_face") {
+        Serial.println("[SBC] No face detected.");
+        // TODO: In future can identify what was detected if not person face perhaps still a person or animal.
+        if (notify_all_motion) notify("Motion Detected", "Motion detected but no face found.");
+        Serial.println("[SBC] No face detected.");
+      } else if (status == "awake") {
+        bootTime = (millis() - sbcStartTime);
+        serverLog("{\"event\":\"boot\", \"bootTime\":\"" + String(float(bootTime) / 1000.0, 4) + "\"}");
+      } else if (status == "call_active" || status == "long_task_active") {
+        longSBCActivity = true;
+        sbcIsRunning = true;
+        if (share_analytics) serverLog("{\"event\":\"" + status + "\"}");
+      } else if (status == "call_ended" || status == "long_task_ended") {
+        longSBCActivity = false;
+        SBCPowerOff();
+      } else if (status == "call_log") {
+        String log;
+        serializeJson(doc["log"].as<JsonArray>(), log);
+        serverLog("{\"event\":\"call\", \"call_duration\":" + String(doc["call_duration"].as<int>()) +
+                  ",\"call_log\":\"" + log + "\"}");
+      } else if (status == "error") {
+        notify("SBC Error", doc["error"].as<String>(), "SBC");
+        serverLog("{\"event\":\"sbc_error\", \"error\":\"" + String(doc["error"].as<String>()) + "\"}");
+        longSBCActivity = false;  // Stays awake for face recog but fails long task (sending picture, call, etc.).
+      } else if (status == "commission_success") {
+        Serial.println("[SBC] Commissioning SBC successful!");
+      }
+    }
+  }
+}
+
 uint8_t getBatteryLevel() {
   int raw = analogRead(BATTERY_PIN);
-  int R1 = 470000;
-  int R2 = 36000;
+  // Adjust for your voltage divider
+  int R1 = 100000;
+  int R2 = 35000;
   float scaleV = ((float)R2 / (float)(R1 + R2));
   float sumVolt = 0;
   for (uint8_t i = 0; i < 10; i++) {
@@ -769,7 +603,8 @@ uint8_t getBatteryLevel() {
   float voltage = (sumVolt / 10);
   int scaled = (int)(voltage * 100);
   switch (scaled) {
-    case 1260 ... 1300: return 100;
+    case 1260 ... 1300:  // 12.6+ volts
+      return 100;
     case 1250: return 90;
     case 1242: return 80;
     case 1232: return 70;
@@ -805,26 +640,6 @@ void monitorBattery(const bool startupCheck) {
 }
 
 // --- NOTIFICATIONS & CONNECTIVITY ---
-
-void FCM_Notification(String title, String body) {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  if (client.connect(fcm_server, 443)) {
-    String payload = "{\"to\":\"/topics/" + USER_ID + "/all\", \"priority\":\"high\", \"notification\":{\"title\":\"" +
-                     title + "\", \"body\":\"" + body + "\"}}";
-    client.println("POST /fcm/send HTTP/1.1");
-    client.println("Authorization: key=" + String(fcm_key));
-    client.println("Content-Type: application/json");
-    client.print("Content-Length: ");
-    client.println(payload.length());
-    client.println();
-    client.print(payload);
-  }
-  client.stop();
-}
-
 const char *resolveMethod(HTTPMethod method) {
   switch (method) {
     case HTTP_GET: return "GET";
@@ -853,7 +668,7 @@ HTTPResponse handleApiRequest(const String &endpoint, String payload, String tok
     http.addHeader("Authorization", "Bearer " + REFRESH_TOKEN);
   }
 
-  Serial.printf("[API CALL] Endpoint: %s - Method: %s\n[API PAYLOAD] %s\n",
+  Serial.printf("[API CALL] Endpoint: %s - Method: %s\n[API PAYLOAD] Payload: %s\n",
                 endpoint.substring(api_base_endpoint.length()).c_str(), resolveMethod(method), payload.c_str());
 
   int httpResponseCode = 0;
@@ -879,12 +694,13 @@ HTTPResponse handleApiRequest(const String &endpoint, String payload, String tok
   String response = "";
   if (httpResponseCode > 0) {
     response = http.getString();
+    // Truncate response in logs if too long for readability
     if (method == HTTP_PATCH) {
-      int start = response.indexOf(payload.substring(1, 10));
+      int start = response.indexOf(payload.substring(1, 10));  // Find start of payload in response for better context
       response = "Updated: " + response.substring(start, start + payload.length());
     }
-    Serial.printf("[API RESPONSE] Code: %d\n[API RESPONSE] %s%s\n", httpResponseCode, response.c_str(),
-                  (response.length() >= 100 ? "..." : ""));
+    Serial.printf("[API RESPONSE] Code: %d\n[API RESPONSE] Response: %s%s\n", httpResponseCode, response.c_str(),
+                  (response.length() >= 100 ? "..." : ""));  // Truncate response for brevity
   } else {
     Serial.printf("[HTTP] Request failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
   }
@@ -898,7 +714,7 @@ String getCurrentTimestamp() {
   time_t now;
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
-    return String(millis());
+    return String(millis());  // Fallback to millis if time not available
   }
   char buffer[30];
   strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
@@ -907,12 +723,13 @@ String getCurrentTimestamp() {
 
 void notify(String title, String body, String name) {
   if (WiFi.status() != WL_CONNECTED) {
+    // Store last 10 notifications to send when back online using circular queue
     if (head == tail && pendingNotificationsCount == MAX_NOTIF) {
       head = (head + 1) % MAX_NOTIF;
       pendingNotificationsCount--;
     }
 
-    pendingNotifications[tail][0] = getCurrentTimestamp();
+    pendingNotifications[tail][0] = getCurrentTimestamp();  // real timestamp
     pendingNotifications[tail][1] = title;
     pendingNotifications[tail][2] = body;
     tail = (tail + 1) % MAX_NOTIF;
@@ -932,23 +749,19 @@ void notify(String title, String body, String name) {
       head = (head + 1) % MAX_NOTIF;
       pendingNotificationsCount--;
     }
-    head = tail;
+    head = tail;  // Reset queue
   }
 
   if (share_analytics) {
     serverLog("{\"event\":\"notification\", \"title\":\"" + title + "\"}");
   }
 
+  // POST to notification endpoint
   String payload = "{\"user_id\":\"" + USER_ID + "\",\"lock_id\":\"" + LOCK_ID + "\",\"name\":\"" + name +
                    "\",\"timestamp\":\"" + getCurrentTimestamp() + "\",\"title\":\"" + title + "\",\"body\":\"" + body +
                    "\"}";
+  // Serial.printf("Notification Payload: %s\n", payload.c_str());
   handleApiRequest(notification_endpoint, payload);
-  mqttClient.publish(
-      (String(LOCK_ID) + "/notification").c_str(),
-      String("{\"title\":\"" + title + "\",\"body\":\"" + body + "\",\"timestamp\":\"" + getCurrentTimestamp() + "\"}")
-          .c_str());
-
-  FCM_Notification(title, body);
 }
 
 bool registerLock(String token) {
@@ -982,6 +795,7 @@ void connectToWifi(const String &ssid, const String &password) {
     return;
   }
 
+  // Set hostname
   String clean_model = String(LOCK_MODEL);
   clean_model.toLowerCase();
   clean_model.replace(" ", "_");
@@ -1003,18 +817,25 @@ void connectToWifi(const String &ssid, const String &password) {
     return;
   }
 
-  Serial.println("WiFi connected! IP: " + WiFi.localIP().toString());
-  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  Serial.println("[WIFI] WiFi connected!");
+  Serial.println("[WIFI] IP address: " + WiFi.localIP().toString());
 
+  // --- BALANCED POWER SAVING MODES ---
+  // Use less aggressive power save for better connectivity
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  // More responsive than MIN_MODEM
+
+  // Set DTIM interval to match router (usually 1-3)
   wifi_config_t conf;
   esp_wifi_get_config(WIFI_IF_STA, &conf);
-  conf.sta.listen_interval = 3;
+  conf.sta.listen_interval = 3;  // Listen every 3 beacons (~300ms with 100ms beacon interval)
   esp_wifi_set_config(WIFI_IF_STA, &conf);
+
+  Serial.println("Wi-Fi Balanced Power Save Enabled");
 }
 
 void wifiPowerSaveOff() {
   esp_wifi_set_ps(WIFI_PS_NONE);
-  Serial.println("Wi-Fi Power Save Mode Disabled");
+  Serial.println("Wi-Fi Power Save Mode Disabled for better performance");
 }
 
 void initialCommisioning() {
@@ -1031,16 +852,22 @@ void initialCommisioning() {
     return;
   }
 
+  // If credentials not in NVS, start BLE and wait for commissioning
   bleServer.begin("JUPY Lock Pro");
   Serial.println("Waiting for BLE commissioning payload to complete...");
 
   unsigned long commissionStart = millis();
   while (millis() - commissionStart < COMMISSION_TIME) {
-    delay(100);
+    delay(100);  // Avoid busy loop
     if (bleServer.requireWifiScan()) {
+      Serial.println("[WiFi Scan] Starting scan...");
+
       int n = WiFi.scanNetworks(false, false, false, 20);
+      Serial.printf("[WiFi Scan] Found %d networks\n", n);
+
       JsonDocument doc;
       JsonArray networks = doc["wifi_networks"].to<JsonArray>();
+
       int limit = (n < 10) ? n : 10;
       for (int i = 0; i < limit; i++) {
         JsonObject network = networks.add<JsonObject>();
@@ -1048,10 +875,13 @@ void initialCommisioning() {
         network["rssi"] = WiFi.RSSI(i);
         network["secured"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
       }
+
       WiFi.scanDelete();
+
       String wifiScanJson;
       serializeJson(doc, wifiScanJson);
       bleServer.wifiScanCompleted(wifiScanJson);
+      Serial.println("[WiFi Scan] Sending response...");
     }
 
     if (bleServer.hasReceivedPayload()) {
@@ -1071,6 +901,7 @@ void initialCommisioning() {
     return;
   }
 
+  // Prompt user to enter pin using keypad/screen and store in prefs
   if (!setupPin()) {
     Serial.println("Failed to setup pin.");
     startDeepSleep();
@@ -1080,26 +911,21 @@ void initialCommisioning() {
   connectToWifi(WIFI_SSID, WIFI_PWD);
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi connection failed. Restarting...");
-    prefs.clear();
+    prefs.clear();  // Discard BLE message
     bleServer.sendResponse("{\"status\":\"wifi_fail\"}");
     startDeepSleep(200);
     return;
   }
 
-  // Commission SBC via MQTT (replaces UART wakeSBC commission call)
-  // GPIO fires first, then command published once broker connection is established
-  localMqttClient.setServer(local_mqtt_host, local_mqtt_port);
-  localMqttClient.setCallback(localMqttCallback);
-  reconnectLocalMQTT();
+  // Commision SBC
+  wakeSBC("{\"cmd\":\"commission\", \"user_id\":\"" + USER_ID + "\", \"lock_id\":\"" + LOCK_ID + "\", \"owner\":\"" +
+            OWNER_NAME + "\",\"model\":\"" + String(LOCK_MODEL) + "\", \"name\":\"" + LOCK_NAME +
+            "\", \"firmware_version\":\"" + String(FIRMWARE_VERSION) + "\", \"ip_address\":\"" +
+            WiFi.localIP().toString() + "\", \"hostname\":\"" + String(WiFi.getHostname()) + "\", \"wifi_ssid\":\"" +
+            WIFI_SSID + "\", \"wifi_pwd\":\"" + WIFI_PWD + "\", token: \"" + prefs.getString("token") + "\"}");
 
-  String commissionCmd = "{\"cmd\":\"commission\", \"user_id\":\"" + USER_ID + "\", \"lock_id\":\"" + LOCK_ID +
-                         "\", \"owner\":\"" + OWNER_NAME + "\", \"model\":\"" + String(LOCK_MODEL) + "\", \"name\":\"" +
-                         LOCK_NAME + "\", \"firmware_version\":\"" + String(FIRMWARE_VERSION) +
-                         "\", \"ip_address\":\"" + WiFi.localIP().toString() + "\", \"hostname\":\"" +
-                         String(WiFi.getHostname()) + "\", \"wifi_ssid\":\"" + WIFI_SSID + "\", \"wifi_pwd\":\"" +
-                         WIFI_PWD + "\", \"token\":\"" + prefs.getString("token") + "\"}";
-  sendToSBC(commissionCmd);
-
+  // Register lock to user account
+  // TODO: move registration to UART response after successful SBC commissioning
   if (!registerLock(prefs.getString("token"))) {
     prefs.clear();
     bleServer.sendResponse("{\"error\":\"Failed to register Lock\"}");
@@ -1110,12 +936,13 @@ void initialCommisioning() {
   notify("Lock Registered", "Hi " + OWNER_NAME + " 👋! I am your new " + LOCK_MODEL +
                                 ".\nWelcome to JUPY Locks, keeping you safe and secure! 😉😏.");
 
+  // Send lock info via BLE TX characteristic (after WiFi is connected)
   String ipStatus = "{\"lock_id\":\"" + String(LOCK_ID) + "\",\"lock_ip\":\"" + WiFi.localIP().toString() +
                     "\",\"hostname\":\"" + String(WiFi.getHostname()) + "\"}";
   bleServer.sendResponse(ipStatus);
 
   for (int i = 0; i < 5; i++) {
-    delay(100);
+    delay(100);  // Avoid busy loop
     if (bleServer.hasReceivedIPAck()) {
       break;
     } else {
@@ -1124,16 +951,18 @@ void initialCommisioning() {
     }
   }
 
+  // close ble server
   bleServer.end();
-  disableBLE();
+  disableBLE();  // Disable BLE after commissioning
 }
 
 void setOnline(bool online) {
   String status = (online) ? "online" : "offline";
   if (share_analytics) {
-    serverLog("{\"event\":\"mqtt_status\", \"state\":\"" + status + "\", \"timestamp\":\"" + getCurrentTimestamp() +
+    serverLog("{\"event\":\"mqtt_status\", \"state\":\"" + status + "\", timestamp\":\"" + getCurrentTimestamp() +
               "\"}");
   }
+
   handleApiRequest(lock_endpoint, "{\"online\":" + String(online ? "true" : "false") + "}", "", HTTP_PATCH);
 
   String topic = String(LOCK_ID) + "/lock/status";
@@ -1143,8 +972,6 @@ void setOnline(bool online) {
       ("{\"status\":\"" + statusMsg + "\", \"timestamp\":\"" + getCurrentTimestamp() + "\", \"msg\":\"" + msg + "\"}");
   mqttClient.publish(topic.c_str(), payload.c_str(), true);
   Serial.println("[MQTT] Published status: " + payload);
-
-  sendToSBC("{\"cmd\":\"on\", \"state\":\"" + status + "\"}");
 }
 
 void endMQTTSession() {
@@ -1160,20 +987,16 @@ void startMQTTSession() {
 }
 
 void reconnectMQTT() {
-  if (mqttClient.connected()) return;
-
-  unsigned long now = millis();
-  if (lastMqttRetry != 0 && now - lastMqttRetry < 5000) return;
-  lastMqttRetry = now;
-
-  Serial.printf("[MQTT] Connecting to HiveMQ as %s ...\n", LOCK_MODEL);
   if (mqttClient.connect(LOCK_MODEL, mqtt_user, mqtt_pwd)) {
     Serial.println("[MQTT] Connected Successfully.");
     mqttClient.subscribe((String(LOCK_ID) + "/lock/status").c_str(), 1);
     mqttClient.subscribe((String(LOCK_ID) + "/lock/commands").c_str(), 1);
     setOnline(true);
   } else {
-    Serial.printf("[MQTT] Connection failed, rc=%d — will retry in 5s\n", mqttClient.state());
+    Serial.print("[MQTT] Connection failed, rc=");
+    Serial.print(mqttClient.state());
+    Serial.println(" try again in 5 seconds");
+    delay(5000);
   }
 }
 
@@ -1188,7 +1011,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
 
   if (doc["cmd"] == "unlock") unlockDoor(doc["name"], "Remote App");
   else if (doc["cmd"] == "start_call")
-    sendToSBC("{\"cmd\":\"start_call\",\"room_id\":\"" + doc["room_id"].as<String>() + "\"}");
+    wakeSBC("{\"cmd\":\"start_call\",\"room_id\":\"" + doc["room_id"].as<String>() + "\"}");
   else if (doc["cmd"] == "end_call") endMQTTSession();
 }
 
@@ -1197,16 +1020,22 @@ void serverLog(String log) {
 }
 
 void handleRequest(String route, HTTPMethod method, std::function<HTTPResponse(const String &)> callback) {
+  // Use HTTP_ANY so OPTIONS preflight is caught per-route
+  // (the library's canHandle() rejects method mismatches before onNotFound fires)
   localServer.on(route, HTTP_ANY, [method, route, callback]() {
+    // CORS headers on ALL responses from this route
     localServer.sendHeader("Access-Control-Allow-Origin", "*");
     localServer.sendHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, PATCH, OPTIONS");
     localServer.sendHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
     localServer.sendHeader("Access-Control-Allow-Private-Network", "true");
 
+    // Handle OPTIONS preflight
     if (localServer.method() == HTTP_OPTIONS) {
       localServer.send(204);
       return;
     }
+
+    // Reject wrong method
     if (localServer.method() != method) {
       localServer.send(405, "text/plain", "Method Not Allowed");
       return;
@@ -1216,6 +1045,7 @@ void handleRequest(String route, HTTPMethod method, std::function<HTTPResponse(c
     if (localServer.hasArg("plain")) {
       body = localServer.arg("plain");
     } else if (method == HTTP_GET) {
+      // For GET requests, we can also pass query parameters as body
       if (localServer.args() == 0) {
         body = "{}";
       } else {
@@ -1223,7 +1053,7 @@ void handleRequest(String route, HTTPMethod method, std::function<HTTPResponse(c
         for (uint8_t i = 0; i < localServer.args(); i++) {
           body += "\"" + localServer.argName(i) + "\":\"" + localServer.arg(i) + "\",";
         }
-        body.remove(body.length() - 1);
+        body.remove(body.length() - 1);  // Remove trailing comma
         body += "}";
       }
     } else {
@@ -1302,20 +1132,17 @@ HTTPResponse updateSettings(String body) {
                              "record_motion", "record_person", "cam_resolution"};
     String settingsJson;
     serializeJson(settings, settingsJson);
-
-    // Push settings to SBC via local MQTT and also publish to settings topic for Pi file write
+    // if any of the settings included send the full settings object to SBC
     for (const String &setting : SBC_settings) {
       if (settings[setting]) {
-        sendToSBC("{\"cmd\":\"update_settings\", \"settings\":" + settingsJson + "}");
-        // Also publish full settings to dedicated topic so Node-RED writes settings.json
-        localMqttClient.publish(TOPIC_SETTINGS, settingsJson.c_str());
+        wakeSBC("{\"cmd\":\"update_settings\", \"settings\":" + settingsJson + "}");
         break;
       }
     }
 
     if (!lock_name.equals(LOCK_NAME)) {
       prefs.putString("lock_name", LOCK_NAME);
-      settings["lock_name"] = NULL;
+      settings["lock_name"] = NULL;  // Remove lock_name
       serializeJson(settings, settingsJson);
       handleApiRequest(lock_endpoint, "{\"settings\":" + settingsJson + "}", "", HTTP_PATCH);
     }
@@ -1331,7 +1158,8 @@ HTTPResponse updateSettings(String body) {
     }
 
     if (share_analytics) {
-      serverLog("{\"type\":\"settings\", \"data\":" + settingsJson + "}");
+      String json = "{type: \"settings\", \"data\":" + settingsJson + "}";
+      serverLog(json.c_str());
     }
 
     prefs.putString("settings", settingsJson);
@@ -1343,6 +1171,7 @@ HTTPResponse updateSettings(String body) {
 
 void setupREST() {
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected. Attempting to reconnect...");
     String WIFI_SSID = prefs.getString("wifi_ssid");
     String WIFI_PWD = prefs.getString("wifi_pwd");
     if (!WIFI_SSID.isEmpty()) {
@@ -1350,13 +1179,14 @@ void setupREST() {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Reconnection failed. Creating access point for server.");
       String ap_ssid = "JUPY_SmartLock_" + String(SIMPLE_ID);
       WiFi.softAP(ap_ssid.c_str(), "12345678");
       delay(100);
       return;
     }
   }
-  wifiPowerSaveOff();
+  wifiPowerSaveOff();  // Disable WiFi power save for better performance
 
   handleRequest("/unlock", HTTP_POST, [](String body) {
     JsonDocument data;
@@ -1368,28 +1198,26 @@ void setupREST() {
       unlockDoor(data["name"], "local WiFi");
       return HTTPResponse{200, "application/json", "{\"status\":\"success\"}"};
     } else {
+      Serial.println("Unauthorized unlock attempt via REST API");
+      Serial.println("Provided pin: " + data["pin"].as<String>() + " Stored pin: " + prefs.getString("pin"));
       return HTTPResponse{401, "application/json",
                           "{\"status\":\"fail\", \"error\":\"Wrong pin stored, pin may have been updated\" }"};
     }
   });
-
   handleRequest("/health", HTTP_GET,
                 [](String body) { return HTTPResponse{200, "application/json", "{\"status\":\"I am healthy\"}"}; });
   handleRequest("/settings", HTTP_PATCH, &updateSettings);
-
   handleRequest("/status", HTTP_GET, [](String body) {
     String status = "{";
     status += "\"lock_name\":\"" + LOCK_NAME + "\",";
     status += "\"owner\":\"" + OWNER_NAME + "\",";
     status += "\"wifi_ssid\":\"" + prefs.getString("wifi_ssid") + "\",";
     status += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
-    status += "\"battery\":\"" + String(getBatteryLevel()) + "\",";
-    status += "\"sbc_online\":" + String(localMqttClient.connected() ? "true" : "false") + ",";
+    status += "\"battery\":\"" + String(getBatteryLevel()) + "\"";
     status += "\"settings\":" + prefs.getString("settings", "{}");
     status += "}";
     return HTTPResponse{200, "application/json", status};
   });
-
   handleRequest("/change-pin", HTTP_PATCH, [](String body) {
     JsonDocument data;
     DeserializationError error = deserializeJson(data, body);
@@ -1399,38 +1227,52 @@ void setupREST() {
     if (!data["user_id"].as<String>().equals(USER_ID) && !data["reset_pin"].as<String>().equals(RESET_PIN)) {
       return HTTPResponse{401, "application/json", "{\"status\":\"fail\", \"error\":\"Unauthorized request\"}"};
     }
+
+    // TODO: Set 2 min timeout on change pin request on forntend and add auth timeout here
+    // if (!setupPin()) {
+    //   return HTTPResponse{500, "application/json", "{\"status\":\"fail\", \"error\":\"Failed to setup new pin\"}"};
+    // }
+
     String newPin = data["new_pin"].as<String>();
     if (newPin.length() < 4 || newPin.length() > 12) {
       return HTTPResponse{400, "application/json",
                           "{\"status\":\"fail\", \"error\":\"New pin must be between 4 and 12 characters\"}"};
     } else {
+      Serial.println("[PIN CHANGE] New Pin: " + newPin);
       prefs.putString("pin", newPin);
       notify("Pin Changed", OWNER_NAME + " changed the lock pin.", OWNER_NAME);
       return HTTPResponse{200, "application/json", "{\"status\":\"success\"}"};
     }
     return HTTPResponse{400, "application/json", "{\"status\":\"fail\", \"error\":\"Required fields missing\"}"};
   });
-
   handleRequest("/reset", HTTP_POST, [](String body) {
     JsonDocument data;
     DeserializationError error = deserializeJson(data, body);
     if (error) {
       return HTTPResponse{400, "application/json", "{\"status\":\"fail\", \"error\":\"Parsing failed. Try again\" }"};
     }
+    String unlockMsg = "";
+
     if (data["reset_pin"]) {
       if (!data["user_id"].as<String>().equals(USER_ID) && !data["reset_pin"].as<String>().equals(RESET_PIN))
         return HTTPResponse{401, "application/json", "{\"status\":\"fail\", \"error\":\"Unauthorized\"}"};
-      unlockDoor("Reset Lock", "REST API");
+      unlockMsg = "Reset Lock";
+      unlockDoor(unlockMsg, "REST API");
+
+      // Open door for 6 seconds then wait until user presses button to complete reset
       digitalWrite(LOCK_PIN, HIGH);
       delay(6000);
       digitalWrite(LOCK_PIN, LOW);
+
       FORCED_RESET_LOCK = true;
       prefs.putBool("forced_reset", true);
       return HTTPResponse{200, "application/json", "{\"status\":\"success\"}"};
     }
+
     return HTTPResponse{400, "application/json", "{\"status\":\"fail\", \"error\":\"Required fields missing\"}"};
   });
 
+  // Global CORS preflight handler — catches all OPTIONS requests
   localServer.onNotFound([]() {
     if (localServer.method() == HTTP_OPTIONS) {
       localServer.sendHeader("Access-Control-Allow-Origin", "*");
@@ -1452,7 +1294,7 @@ void setupREST() {
 void drawKeypad() {
   int width = tft.width();
   int height = tft.height();
-  int cellWidth = width / 3;
+  int cellWidth = width / 3;  // for 240x320 display, each cell is 80x60
   int cellHeight = height / 4;
   Serial.println("Display dimensions: " + String(width) + "x" + String(height));
   tft.fillScreen(TFT_BLACK);
@@ -1480,26 +1322,32 @@ void drawKeypad() {
   }
 }
 
-unsigned long valid_touch_time = 0;
+unsigned long valid_touch_time = 0;  // When last touch event for debouncing
 unsigned long tft_touch_response_time = 0;
 bool isBeingPressed = false;
 unsigned long t_irq_response = 0;
 
 void handleTouch() {
   uint16_t x = 0, y = 0, z = 0;
-  bool tftTouched = tft.getTouch(&x, &y, 600);
+  bool tftTouched = tft.getTouch(&x, &y, 600);  // Using 600 threshold helps noise
   z = tft.getTouchRawZ();
 
   if (tftTouched) {
-    if (x == 0 && y == 0) return;
-    tft_touch_response_time = millis();
+    if (x == 0 && y == 0) return;        // Still ignore (0,0)
+    tft_touch_response_time = millis();  // Refresh our "last seen" timer
   }
 
+  // 1. Detect START (Stable Rising Edge)
+  // Only trigger if we aren't already processing a touch
   if (tftTouched && !isBeingPressed) {
+    // Debounce: ensure we aren't double-tapping too fast (300ms)
     if (millis() - valid_touch_time < 300) return;
+
     isBeingPressed = true;
     valid_touch_time = millis();
+
     Serial.printf("Touch START tft=(%u,%u,%u) T_IRQ=%d\n", x, y, z, digitalRead(T_IRQ));
+
     int col = x / (tft.width() / 3);
     int row = y / (tft.height() / 4);
     if (row >= 0 && row < 4 && col >= 0 && col < 3) {
@@ -1507,6 +1355,8 @@ void handleTouch() {
     }
   }
 
+  // 2. Detect Touch END (Stable Falling Edge)
+  // Only believe the touch is over if hardware says 'false' for more than 100ms
   if (!tftTouched && isBeingPressed) {
     if (millis() - tft_touch_response_time > 100) {
       isBeingPressed = false;
@@ -1516,24 +1366,15 @@ void handleTouch() {
   }
 }
 
-unsigned long keypad_last_pressed_time = 0;
 void handleKeypad() {
-  if (millis() - keypad_last_pressed_time < 300) return;
-  keypad_last_pressed_time = millis();
-
-  if(CURRENT_LED_COLOR != DEF_LED_COLOR) {
-    resetLEDColor();
-  }
-
   char key = keypad.getKey();
   if (key) {
     int cellWidth = tft.width() / 3;
     int cellHeight = tft.height() / 4;
-    Serial.println("Keypad presessed key: " + String(key));
     for (int r = 0; r < ROWS; r++) {
       for (int c = 0; c < COLS; c++) {
         if (keypad_keys[r][c] == key) {
-          if (c >= 3) return;
+          if (c >= 3) return;  // Ignore fourth column
           int cellLeft = c * cellWidth;
           int cellTop = r * cellHeight + 10;
           int cellW = cellWidth - 4;
@@ -1548,10 +1389,10 @@ void handleKeypad() {
   }
 }
 
-void captureFace() { sendToSBC("{\"cmd\":\"capture_face\"}"); }
+void captureFace() { wakeSBC("{\"cmd\":\"capture_face\"}"); }
 
 void doorbellChime() {
-  sendToSBC("{\"cmd\":\"doorbell_chime\"}");
+  wakeSBC("{\"cmd\":\"doorbell_chime\"}");
   notify("Doorbell", "Someone is at " + OWNER_NAME + "'s " + LOCK_NAME + "!");
   startMQTTSession();
 }
@@ -1560,7 +1401,6 @@ bool enteringNewPin = false;
 bool validating_pin = false;
 bool checkNewPin = false;
 String newPinBuffer = "";
-
 void processKeyPress(int row, int col, int x, int y) {
   tft.fillCircle(x, y, 5, TFT_WHITE);
   lastTouchX.push_back(x);
@@ -1568,19 +1408,18 @@ void processKeyPress(int row, int col, int x, int y) {
   lastTouchColor.push_back(TFT_BLACK);
   touchFadeTime.push_back(millis() + 750);
 
-  lastActivity = millis();  // Extend User Aware Timeouts
-
   Serial.printf("Key press at row: %d, col: %d\n", row, col);
-  setLEDColor(CRGB::HotPink);
-  if (row == 3 && col == 0) {
+
+  if (row == 3 && col == 0) {  // X - Clear
     passcodeBuffer = "";
-  } else if (row == 3 && col == 2) {
+  } else if (row == 3 && col == 2) {  // # - Bell/Enter
     if (passcodeBuffer.length() == 0) {
       doorbellChime();
     } else {
       if (enteringNewPin) {
         checkNewPin = true;
       } else if (String("1234").equals(passcodeBuffer)) {
+        // Test Shut dowwn
         Serial.println("Test shutdown command received.");
         startDeepSleep(2000);
       } else if (checkPin(passcodeBuffer.c_str())) {
@@ -1590,49 +1429,67 @@ void processKeyPress(int row, int col, int x, int y) {
         if (unlockAttempts < 3) unlockAttempts += 1;
         else {
           faceUnlockTimeout = millis();
-          intruder = 0;
+          intruder = 0;  // reset intruder count to start timeout
           captureFace();
           notify("Intruder Alert!", "Multiple incorrect pin attempts at " + OWNER_NAME + "'s " + LOCK_NAME + "!");
         }
-        Serial.println("[Keypad] Incorrect passcode: " + passcodeBuffer);
+        Serial.println("[Keypad] Incorrect passcode entered: " + passcodeBuffer);
         Serial.println("[Keypad] Stored pin: " + prefs.getString("pin"));
       }
       passcodeBuffer = "";
     }
   } else {
+    // Number keys
     if (passcodeBuffer.length() < 12) passcodeBuffer += touchpad_keys[row][col];
-    else Serial.println("Passcode buffer full: " + touchpad_keys[row][col]);
+    else Serial.println("Passcode buffer full. Ignoring additional input until cleared: " + touchpad_keys[row][col]);
   }
 
   if (enteringNewPin) newPinBuffer += passcodeBuffer;
+
   Serial.println("Current passcode buffer: " + passcodeBuffer);
 }
 
 void touch_calibrate() {
   uint16_t calData[5];
+  uint8_t calDataOK = 0;
+
+  // Calibrate
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(20, 0);
   tft.setTextFont(2);
   tft.setTextSize(1);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
   tft.println("Touch corners as indicated");
+
   tft.setTextFont(1);
   tft.println();
+
   tft.calibrateTouch(calData, TFT_MAGENTA, TFT_BLACK, 15);
 
+  // tft.setTouch(calData);
+
+  Serial.println();
   Serial.println();
   Serial.println("// Use this calibration code in setup():");
-  Serial.print("  uint16_t calData[5] = { ");
+  Serial.print("  uint16_t calData[5] = ");
+  Serial.print("{ ");
+
   for (uint8_t i = 0; i < 5; i++) {
     Serial.print(calData[i]);
     if (i < 4) Serial.print(", ");
   }
+
   Serial.println(" };");
-  Serial.println("  tft.setTouch(calData);");
+  Serial.print("  tft.setTouch(calData);");
+  Serial.println();
+  Serial.println();
 
   tft.fillScreen(TFT_BLACK);
+
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.println("Calibration complete!");
+  tft.println("Calibration code sent to Serial port.");
 }
 
 bool setupPin() {
@@ -1640,7 +1497,7 @@ bool setupPin() {
   drawKeypad();
   enteringNewPin = true;
   bleServer.sendResponse("{\"status\":\"prompt_enter_pin\"}");
-  long int pinTimeout = millis() + 2 * 60 * 1000;
+  long int pinTimeout = millis() + 2 * 60 * 1000;  // 2 minutes timeout
 
   while (millis() < pinTimeout) {
     handleTouch();
@@ -1650,17 +1507,19 @@ bool setupPin() {
       if (newPinBuffer.length() >= 4 && newPinBuffer.length() <= 12) {
         if (validating_pin) {
           if (!checkPin(newPinBuffer.c_str())) {
+            Serial.println("[SETUP PIN] Entered pin does not match current pin. Ignoring: " + newPinBuffer);
             bleServer.sendResponse("{\"status\":\"enter_pin\", \"success\":\"false\", \"error\":\"Entered pin does not "
                                    "match current pin. Try again.\"}");
             passcodeBuffer = "";
             enteringNewPin = false;
-            prefs.putString("pin", "");
+            prefs.putString("pin", "");  // Clear invalid pin
             return false;
           } else {
+            Serial.println("[SETUP PIN] Current pin '" + newPinBuffer + "' validated. Setting new pin.");
             bleServer.sendResponse("{\"status\":\"new_pin\", \"success\":\"true\"}");
             passcodeBuffer = "";
             newPinBuffer = "";
-            validating_pin = false;
+            validating_pin = false;  // Move to next step
             enteringNewPin = false;
             return true;
           }
@@ -1668,6 +1527,7 @@ bool setupPin() {
         prefs.putString("pin", newPinBuffer);
         notify("Pin Changed", OWNER_NAME + " set a new lock pin.", OWNER_NAME);
       } else {
+        Serial.println("[SETUP PIN] Pin must be between 4 and 12 characters. Ignoring: " + newPinBuffer);
         bleServer.sendResponse("{\"status\":\"enter_pin\", \"warn\":\"Pin must be 4-12 characters. Try again.\"}");
         passcodeBuffer = "";
       }

@@ -66,6 +66,13 @@ bool BLECommissioningServer::hasReceivedPayload() { return payloadReceived; }
 
 bool BLECommissioningServer::hasReceivedIPAck() { return ipReceivedAck; }
 
+bool BLECommissioningServer::requireWifiScan() { return wifiScanRequired; }
+
+void BLECommissioningServer::wifiScanCompleted(const String &networks) {
+  wifiScanRequired = false;
+  sendResponse(networks);
+}
+
 // ==================== ServerCallbacks ====================
 void ServerCallbacks::onConnect(BLEServer *pServer) {
   bleServer->deviceConnected = true;
@@ -85,56 +92,32 @@ static BLECommissioningServer *scanResultBleServer = nullptr;
 static void wifiScanTask(void *parameter) {
   Serial.println("[WiFi Scan] Starting scan...");
 
-  // Start WiFi scan (this can take several seconds)
-  int n = WiFi.scanNetworks(false, false, false, 20);  // Reduced max results to save memory
-
-  if (n == -1) {
-    Serial.println("[WiFi Scan] Scan failed");
-    scanResultBleServer->sendResponse("{\"error\":\"WiFi scan failed\"}");
-    wifiScanTaskHandle = nullptr;
-    vTaskDelete(NULL);
-    return;
-  } else if (n == 0) {
-    Serial.println("[WiFi Scan] No networks found");
-    scanResultBleServer->sendResponse("[]");
-    wifiScanTaskHandle = nullptr;
-    vTaskDelete(NULL);
-    return;
-  }
+  int n = WiFi.scanNetworks(false, false, false, 20);
 
   Serial.printf("[WiFi Scan] Found %d networks\n", n);
 
-  // Add each network to the JSON array - use static buffer to avoid stack allocation
+  // Use DynamicJsonDocument - much more memory efficient
+  JsonDocument doc;
+  JsonArray networks = doc["wifi_networks"].to<JsonArray>();
+
   int limit = (n < 10) ? n : 10;
-
-  static char jsonResponse[1024];  // Static buffer to avoid stack allocation
-  snprintf(jsonResponse, sizeof(jsonResponse), "{\"wifi_networks\": [");
-  
   for (int i = 0; i < limit; i++) {
-    char networkJson[128];
-    snprintf(networkJson, sizeof(networkJson), 
-             "{\"ssid\":\"%s\",\"rssi\":%d,\"secured\":%s}",
-             WiFi.SSID(i).c_str(), 
-             WiFi.RSSI(i),
-             (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) ? "true" : "false");
-    
-    if (i > 0) {
-      strcat(jsonResponse, ",");
-    }
-    strcat(jsonResponse, networkJson);
+    JsonObject network = networks.add<JsonObject>();
+    network["ssid"] = WiFi.SSID(i);
+    network["rssi"] = WiFi.RSSI(i);
+    network["secured"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
   }
-  strcat(jsonResponse, "]}");
 
-  // Free scan results to free memory
   WiFi.scanDelete();
 
-  Serial.println("[WiFi Scan] Sending response...");
-  scanResultBleServer->sendResponse(jsonResponse);
+  String response;
+  serializeJson(doc, response);
 
-  // Clear static data before exiting
+  Serial.println("[WiFi Scan] Sending response...");
+  scanResultBleServer->sendResponse(response);
+
   scanResultBleServer = nullptr;
   wifiScanTaskHandle = nullptr;
-
   vTaskDelete(NULL);
 }
 
@@ -158,7 +141,7 @@ void RxCharacteristicCallbacks::onWrite(BLECharacteristic *pCharacteristic) {
     return;
   }
 
-  if(doc["status"] && doc["status"].as<String>().equals("ip_ack")) {
+  if (doc["status"] && doc["status"].as<String>().equals("ip_ack")) {
     bleServer->ipReceivedAck = true;
     Serial.println("[BLE] Received IP acknowledgment from app.");
     return;
@@ -166,21 +149,12 @@ void RxCharacteristicCallbacks::onWrite(BLECharacteristic *pCharacteristic) {
 
   if (doc["request"] && doc["request"].as<String>().equals("wifi_networks")) {
     // Check if a scan is already in progress
-    if (wifiScanTaskHandle != nullptr) {
+    if (bleServer->requireWifiScan()) {
       bleServer->sendResponse("{\"error\":\"Scan already in progress\"}");
       return;
     }
 
-    // Start WiFi scan in a separate task with larger stack to avoid stack overflow
-    scanResultBleServer = bleServer;
-    xTaskCreatePinnedToCore(wifiScanTask,         // Task function
-                            "WiFiScan",           // Task name
-                            12288,                // Stack size (12KB - increased for safety)
-                            NULL,                 // Parameters
-                            1,                    // Priority
-                            &wifiScanTaskHandle,  // Task handle
-                            1                     // Core (1 = separate from BLE core)
-    );
+    bleServer->wifiScanRequired = true;  // Set flag to start WiFi scan
 
     // Send initial response that scan has started
     bleServer->sendResponse("{\"status\":\"scanning\"}");
