@@ -70,10 +70,6 @@ const char *local_mqtt_pwd = "jupyLock012";
 // Pi → ESP32
 #define TOPIC_SBC_STATUS "jupy/sbc/status"  // Status responses from SBC: match, intruder, no_face, awake, error, etc.
 
-// --- Firebase Cloud Messaging ---
-const char *fcm_server = "fcm.googleapis.com";
-const char *fcm_key = "YOUR_FCM_SERVER_KEY";  // Legacy Key or OAuth2 Relay
-
 // --- Supabase ---
 const char *projectId = "ienqcmbfdobzcggkhajc";
 const String api_base_endpoint = "https://" + String(projectId) + ".supabase.co/functions/v1/make-server-a213de84";
@@ -810,26 +806,6 @@ void monitorBattery(const bool startupCheck) {
 
 // --- NOTIFICATIONS & CONNECTIVITY ---
 
-void FCM_Notification(String title, String body) {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  if (client.connect(fcm_server, 443)) {
-    String payload = "{\"to\":\"/topics/" + USER_ID + "/all\", \"priority\":\"high\", \"notification\":{\"title\":\"" +
-                     title + "\", \"body\":\"" + body + "\"}}";
-    client.println("POST /fcm/send HTTP/1.1");
-    client.println("Authorization: key=" + String(fcm_key));
-    client.println("Content-Type: application/json");
-    client.print("Content-Length: ");
-    client.println(payload.length());
-    client.println();
-    client.print(payload);
-  }
-  client.stop();
-  Serial.println("[FCM] Notification Sent: " + title + " - " + body);
-}
-
 const char *resolveMethod(HTTPMethod method) {
   switch (method) {
     case HTTP_GET: return "GET";
@@ -953,8 +929,6 @@ void notify(String title, String body, String name) {
       (String(LOCK_ID) + "/notification").c_str(),
       String("{\"title\":\"" + title + "\",\"body\":\"" + body + "\",\"timestamp\":\"" + getCurrentTimestamp() + "\"}")
           .c_str());
-
-  FCM_Notification(title, body);
 }
 
 bool registerLock(String token) {
