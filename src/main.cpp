@@ -364,6 +364,24 @@ void setup() {
   localMqttClient.setBufferSize(1024);
   if (WiFi.status() == WL_CONNECTED) {
     reconnectLocalMQTT();
+
+    String sbcCmd = prefs.getString("commission_cmd", "");
+    if (sbcCmd.isEmpty()) {
+      Serial.println("No pending SBC commission command." + sbcCmd);
+    } else {
+      Serial.println("Pending SBC commission command: " + sbcCmd);
+    }
+    for (uint8_t i = 1; i <= 10; i++) {
+      if (sbcCmd.isEmpty()) break;
+      if (!sendToSBC(sbcCmd)) reconnectLocalMQTT();
+      else break;
+      delay(1000 * i);
+    }
+    if (!sbcCmd.isEmpty()) {
+      Serial.println("[MQTT] Failed to commission SBC after 10 attempts.");
+      notify("Error", "Failed to commission SBC after 10 attempts.");
+      startSleepMode();
+    }
   }
 
   Serial.print("Device Setup Complete. ");
@@ -553,20 +571,30 @@ void handleLocalMqttMsg(const String &status, JsonDocument &doc) {
       Serial.println("[SBC] Received generic success code. Last command executed/stopped successfully.");
       return;
     }
-    notify("SBC Error", sanitizeJsonToStr(error), "SBC");
+    error = sanitizeJsonToString(error);
+    notify("SBC Error", error, "SBC");
     serverLog("sbc_error", "{\"error\":\"" + error + "\"}");
     longSBCActivity = false;
   } else if (status == "commission_success") {
-    Serial.println("[SBC] Commissioning SBC successful!");
-
     if (bleServer.isConnected()) {
-      bleServer.sendResponse("{\"status\": \"sbc_commission_success\"}");
+      bleServer.sendResponse("{\"status\": \"commission_success\"}");
     }
-
+    String sbcIp = doc["sbc_ip_address"].as<String>();
+    String sbcHostname = doc["sbc_hostname"].as<String>();
+    if (sbcIp.isEmpty() || sbcHostname.isEmpty()) {
+      Serial.println("[SBC] Commission received but IP or hostname is empty.");
+      return;
+    }
     String payload = "{\"sbc_ip_address\":\"" + doc["sbc_ip_address"].as<String>() + "\",\"sbc_hostname\":\"" +
                      doc["sbc_hostname"].as<String>() + "\"}";
-
-    handleApiRequest(lock_endpoint, payload.c_str(), "", HTTP_PATCH);
+    HTTPResponse response = handleApiRequest(lock_endpoint, payload.c_str(), "", HTTP_PATCH);
+    if (response.code == 200) {
+      Serial.println("[SBC] SBC info updated to backend successfully.");
+      prefs.putString("commission_cmd", "");
+      Serial.println("[SBC] Commissioning SBC successful!");
+    } else {
+      Serial.printf("[SBC] Failed to update SBC info to backend. Response code: %d\n", response.code);
+    }
   } else {
     Serial.println("[SBC] Unknown status: " + status);
   }
@@ -1185,6 +1213,7 @@ void reconnectMQTT() {
     Serial.println("[MQTT] Connected Successfully.");
     mqttClient.subscribe((String(LOCK_ID) + "/lock/status").c_str(), 1);
     mqttClient.subscribe((String(LOCK_ID) + "/lock/commands").c_str(), 1);
+    mqttActive = true;
     setOnline(true);
   } else {
     Serial.printf("[MQTT] Connection failed, rc=%d — will retry in 5s\n", mqttClient.state());
