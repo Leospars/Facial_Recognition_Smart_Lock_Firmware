@@ -1081,13 +1081,23 @@ void initialCommissioning() {
     return;
   }
 
-  String commissionCmd = "{\"cmd\":\"commission\", \"user_id\":\"" + USER_ID + "\", \"lock_id\":\"" + LOCK_ID +
-                         "\", \"owner\":\"" + OWNER_NAME + "\", \"model\":\"" + String(LOCK_MODEL) + "\", \"name\":\"" +
-                         LOCK_NAME + "\", \"firmware_version\":\"" + String(FIRMWARE_VERSION) +
-                         "\", \"ip_address\":\"" + WiFi.localIP().toString() + "\", \"hostname\":\"" +
-                         String(WiFi.getHostname()) + "\", \"wifi_ssid\":\"" + WIFI_SSID + "\", \"wifi_pwd\":\"" +
-                         WIFI_PWD + "\", \"token\":\"" + prefs.getString("token") + "\"}";
+  JsonDocument doc;
+  doc["cmd"] = "commission";
+  doc["user_id"] = USER_ID;
+  doc["lock_id"] = LOCK_ID;
+  doc["owner"] = OWNER_NAME;
+  doc["model"] = String(LOCK_MODEL);
+  doc["name"] = LOCK_NAME;
+  doc["firmware_version"] = String(FIRMWARE_VERSION);
+  doc["ip_address"] = WiFi.localIP().toString();
+  doc["hostname"] = WiFi.getHostname();
+  doc["wifi_ssid"] = WIFI_SSID;
+  doc["wifi_pwd"] = WIFI_PWD;
+  doc["token"] = prefs.getString("token");
+  String commissionCmd;
+  serializeJson(doc, commissionCmd);
   sendToSBC(commissionCmd);
+  prefs.putString("commission_cmd", commissionCmd);
 
   if (!registerLock(prefs.getString("token"))) {
     prefs.clear();
@@ -1097,7 +1107,7 @@ void initialCommissioning() {
   }
 
   notify("Lock Registered", "Hi " + OWNER_NAME + "! I am your new " + LOCK_MODEL +
-                                ".\nWelcome to JUPY Locks, keeping you safe and secure! :).");
+                                ".\\nWelcome to JUPY Locks, keeping you safe and secure! :).");
 
   String ipStatus = "{\"lock_id\":\"" + String(LOCK_ID) + "\",\"lock_ip\":\"" + WiFi.localIP().toString() +
                     "\",\"hostname\":\"" + String(WiFi.getHostname()) + "\"}";
@@ -1299,8 +1309,6 @@ HTTPResponse updateSettings(String body) {
     for (const String &setting : SBC_settings) {
       if (settings[setting]) {
         sendToSBC("{\"cmd\":\"update_settings\", \"settings\":" + settingsJson + "}");
-        // Also publish full settings to dedicated topic so Node-RED writes settings.json
-        localMqttClient.publish(TOPIC_SETTINGS, settingsJson.c_str());
         break;
       }
     }
