@@ -597,6 +597,8 @@ void reconnectLocalMQTT() {
 void startSleepMode(unsigned long milli_sec) {
   if (mqttActive) {
     endMQTTSession();
+    Serial.flush();
+    delay(200);  // Brief flush
   }
 
   // Inform Pi before going to sleep
@@ -613,21 +615,33 @@ void startSleepMode(unsigned long milli_sec) {
   esp_bt_controller_deinit();
 
   Serial.println("Radios gracefully shut down.");
-  leds[0] = CRGB::Blue;
-  FastLED.show();
+  setLEDColor(SHUTDOWN_LED_COLOR)
   digitalWrite(TFT_LED, LOW);
   digitalWrite(SBC_PWR_PIN, LOW);  // Hard off on sleep, Pi already notified
 
-  uint64_t high_pin_mask = (1ULL << BUTTON_PIN);
-  esp_sleep_enable_ext1_wakeup(high_pin_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+  uint64_t numpadPinMask = 0;
+  /* RTC I/O GPIO 1- 21, GPIO 3 is strapping pin, GPIO 19&20 are USB-JTAG */
+  // Add Keypad as wake up pins
+  // for (byte rowPin : rowPins) {
+  //   if (rowPin <= 21 && rowPin >= 1 && rowPin != 3) numpadPinMask |= (1ULL << rowPin);
+  //   else Serial.printf("Warning: Row pin %d is not a usable RTC GPIO Pin for wakeup.\n", rowPin);
+  // }
+
+  // Serial.printf("Final wakeup mask: 0x%llx\n", numpadPinMask);
+
+  esp_err_t err = esp_sleep_enable_ext1_wakeup((1 << BUTTON_PIN) | numpadPinMask, ESP_EXT1_WAKEUP_ANY_LOW);
+  if (err != ESP_OK) {
+    Serial.printf("ext1 wakeup config failed: %s\n", esp_err_to_name(err));
+  }
   // esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);  // Wake on LOW (button press)
   if (milli_sec > 0) esp_sleep_enable_timer_wakeup(milli_sec * 1000ULL);
   else if (milli_sec == 0)
-    esp_sleep_enable_timer_wakeup(1 * 24 * 60 * 60 * 1000ULL);  // Sleep for a day if no timer specified
+    esp_sleep_enable_timer_wakeup(3 * 60 * 60 * 1000ULL);  // Sleep for a day if no timer specified
 
   Serial.println("Entering Deep Sleep now...");
 
   Serial.flush();  // Ensure flush completes
+  lightSleepEnabled = false; // change to true if using Light Sleep Mode instead
   esp_deep_sleep_start();
 }
 
@@ -758,6 +772,7 @@ bool checkPin(const char *passCode) {
 
 uint8_t getBatteryLevel() {
   int raw = analogRead(BATTERY_PIN);
+  Serial.printf("[BATTERY] Battery voltage ADC: %d\n", raw);
   int R1 = 470000;
   int R2 = 36000;
   float scaleV = ((float)R2 / (float)(R1 + R2));
@@ -768,6 +783,7 @@ uint8_t getBatteryLevel() {
   }
   float voltage = (sumVolt / 10);
   int scaled = (int)(voltage * 100);
+  Serial.printf("[BATTERY] Battery voltage: %d\n", scaled);
   switch (scaled) {
     case 1260 ... 1300: return 100;
     case 1250: return 90;
