@@ -516,7 +516,7 @@ void localMqttCallback(char *topic, byte *payload, unsigned int length) {
   }
 }
 
-String sanitizeJsonToStr(const String &msg) {
+String sanitizeJsonToString(const String msg) {
   String cleaned = msg;
   if (cleaned.isEmpty()) return msg;
   cleaned.replace("\n", "\\n");
@@ -1240,7 +1240,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
 
 void serverLog(String event, String data) {
   handleApiRequest(analytics_endpoint, "{\"lock_id\":\"" + String(LOCK_ID) + "\",\"event\":\"" + event +
-                                           "\",\"data\":\"" + sanitizeJsonToStr(data) + "\"}");
+                                           "\",\"data\":\"" + sanitizeJsonToString(data) + "\"}");
 }
 
 void handleRequest(String route, HTTPMethod method, std::function<HTTPResponse(const String &)> callback) {
