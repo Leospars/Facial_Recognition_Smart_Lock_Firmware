@@ -1,6 +1,10 @@
 # JUPY Security Lock — Firmware
 
-This repository contains the ESP32 firmware for a Facial Recognition door lock which integrates with a K230D vision module and the JUPY Locks React Native app (separate repo). The firmware manages local PIN entry, face unlock via the K230D, notifications via Firebase Cloud Messaging (FCM), and remote control via MQTT.
+This repository contains the ESP32-C5 firmware for a Facial Recognition door lock which integrates with a Raspberry Pi SBC and the _JUPY Locks_ React Web app (separate repos). The firmware manages local PIN entry, face unlock triggers to the SBC, notifications via Firebase Cloud Messaging (FCM), and remote control via MQTT.
+
+**Other**
+- Web app: [@leospars/Facial_Recog_Lock](https://github.com/Leospars/Facial_Recog_Lock)
+- SBC software and setup: [@leospars/jupy_lock_sbc](https://github.com/Leospars/jupy_lock_sbc)
 
 **Key Features**
 
@@ -118,10 +122,13 @@ Navigate to the dependency folder .pio/[board]/User_Setup.h uncomment your board
 ### Project Images
 
 - Breadboard Assembly
+
 ![Breadboard Assembly Image](./images/Breadboard_Assembly.png)
 
 - Enclosed Door Lock
+
 ![Enclosed Door Lock Image](./images/Enclosed_Door_Lock.png)
 
 - Proposed 3D Model
+
 ![Proposed 3D Model Image](./images/Proposed_3D_Model.png)
